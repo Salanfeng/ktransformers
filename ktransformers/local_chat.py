@@ -15,9 +15,12 @@
 import os
 import platform
 import sys
+import time
+
 project_dir = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, project_dir)
 import torch
+import torch.nn as nn
 import logging
 from transformers import (
     AutoTokenizer,
@@ -34,6 +37,8 @@ from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
 from ktransformers.models.modeling_mixtral import MixtralForCausalLM
 from ktransformers.util.utils import prefill_and_generate
 from ktransformers.server.config.config import Config
+from ktransformers.operators.experts import KExpertsCache
+from pympler import asizeof
 
 custom_models = {
     "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
@@ -41,24 +46,49 @@ custom_models = {
     "MixtralForCausalLM": MixtralForCausalLM,
 }
 
-ktransformer_rules_dir = os.path.dirname(os.path.abspath(__file__)) + "/optimize/optimize_rules/"
-default_optimize_rules ={
-    "DeepseekV2ForCausalLM": ktransformer_rules_dir + "DeepSeek-V2-Chat.yaml",
-    "Qwen2MoeForCausalLM": ktransformer_rules_dir + "Qwen2-57B-A14B-Instruct.yaml",
-    "MixtralForCausalLM": ktransformer_rules_dir + "Mixtral.yaml",
+ktransformer_rules_dir = (
+    os.path.dirname(os.path.abspath(__file__)) + "/optimize/optimize_rules/"
+)
+# use gpu or cpu
+use_gpu = True
+
+default_optimize_rules = {
+    "DeepseekV2ForCausalLM": (
+        ktransformer_rules_dir + "DeepSeek-V2-Chat-gpu.yaml"
+        if use_gpu
+        else ktransformer_rules_dir + "DeepSeek-V2-Chat.yaml"
+    ),
+    # + "DeepSeek-V2-Lite-Chat-multi-gpu.yaml",
+    "Qwen2MoeForCausalLM": ktransformer_rules_dir
+    + "Qwen2-57B-A14B-Instruct-multi-gpu.yaml",
+    "MixtralForCausalLM": (
+        ktransformer_rules_dir + "Mixtral-gpu.yaml"
+        if use_gpu
+        else ktransformer_rules_dir + "Mixtral.yaml"
+    ),
 }
 
+
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1" //debug用，加上会慢不少
 def local_chat(
-    model_path: str,
+    # model_path: str,
     optimize_rule_path: str = None,
-    gguf_path: str = None,
+    # gguf_path: str = None,
     max_new_tokens: int = 1000,
     cpu_infer: int = Config().cpu_infer,
-    use_cuda_graph: bool = True,
+    use_cuda_graph: bool = False,
 ):
+    start = time.time()
+    # model_path = "/opt/pretrained_models/DeepSeek-V2-Lite-Chat"
+    # gguf_path = "/data/yanfansun/ktrans/ktransformers/DeepSeek-V2-Lite-Chat-GGUF"
+    model_path = "/opt/pretrained_models/Mixtral-8x7B-Instruct-v0.1"
+    gguf_path = "/data/yanfansun/ktrans/ktransformers/Mixtral-GGUF"
+    # model_path = "/opt/pretrained_models/Qwen2-57B-A14B-Instruct"
+    # gguf_path = "/data/yanfansun/ktrans/ktransformers/Qwen-GGUF"
     torch.set_grad_enabled(False)
-    
+
     Config().cpu_infer = cpu_infer
+    print("cpu_infer:", Config().cpu_infer)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     torch.set_default_dtype(config.torch_dtype)
@@ -66,9 +96,11 @@ def local_chat(
     with torch.device("meta"):
         if config.architectures[0] in custom_models:
             print("using custom modeling_xxx.py.")
-            if "Qwen2Moe" in config.architectures[0]: # Qwen2Moe must use flash_attention_2 to avoid overflow.
+            if (
+                "Qwen2Moe" in config.architectures[0]
+            ):  # Qwen2Moe must use flash_attention_2 to avoid overflow.
                 config._attn_implementation = "flash_attention_2"
-            if "Mixtral" in config.architectures[0]: 
+            if "Mixtral" in config.architectures[0]:
                 config._attn_implementation = "flash_attention_2"
             model = custom_models[config.architectures[0]](config)
         else:
@@ -89,8 +121,20 @@ def local_chat(
         gguf_path = input(
             "please input the path of your gguf file(gguf file in the dir containing input gguf file must all belong to current model):"
         )
-    optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config)
 
+    # KExpertsCache 单例模式
+    if use_gpu:
+        print("using gpu")
+        cache = KExpertsCache(
+            config=config,
+            load_size=32,  # 不能少于64
+            dtype=torch.get_default_dtype(),
+            devices=["cuda:0"],
+        )
+    else:
+        print("using cpu")
+
+    optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config)
     model.generation_config = GenerationConfig.from_pretrained(model_path)
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
@@ -99,22 +143,83 @@ def local_chat(
     logging.basicConfig(level=logging.INFO)
 
     system = platform.system()
-    if (system == u'Windows'):
-        os.system('cls')
-    else:
-        os.system('clear')
+    content = "请说出2的1到10次方"
 
-    while True:
-        content = input("Chat: ")
-        if content == "":
-            content = "Please write a piece of quicksort code in C++." 
-
-        messages = [{"role": "user", "content": content}]
-        input_tensor = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
+    def get_model_size(model):
+        # 获取模型所有参数的大小（以字节为单位）
+        param_size = sum(
+            param.numel() * param.element_size() for param in model.parameters()
         )
-        torch.set_default_dtype(torch.bfloat16) # TODO: Remove this, replace dtype using config
-        generated = prefill_and_generate(model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph)
+        buffer_size = sum(
+            buffer.numel() * buffer.element_size() for buffer in model.buffers()
+        )
+        total_size = param_size + buffer_size
+
+        # 将字节转换为 GB
+        total_size_gb = total_size / (1024**3)
+        return total_size_gb
+
+    print("model size:", get_model_size(model))
+
+    messages = [{"role": "user", "content": content}]
+    input_tensor = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt"
+    )
+
+    torch.set_default_dtype(
+        torch.bfloat16
+    )  # TODO: Remove this, replace dtype using config
+
+    test = False
+    if test:
+        data = torch.load("/data/yanfansun/ktrans/ktransformers/data.pt")
+        input_tensor = data["input_tensor"][0]
+        expert_ids = data["expert_ids"][0]
+        weights = data["weights"][0]
+        random_weights = []
+        random_expert_ids = []
+        random_input_tensor = []
+        for _ in range(1000):
+            random_input_tensor.append(torch.randn(input_tensor.size()))
+            random_weights.append(torch.randn(torch.Size([2])))
+            random_expert_ids.append(torch.randint(1, 63, torch.Size([2])))
+        experts = model.model.layers[1].mlp.experts.generate_experts
+        input_tensor = input_tensor.contiguous().cpu()
+        expert_ids = expert_ids.contiguous().cpu()
+        weights = weights.contiguous().to(torch.float32).cpu()
+        output = torch.empty_like(input_tensor).contiguous()
+        end = time.time()
+        while (end - start) < 27.5:
+            print("waiting for 30s")
+            time.sleep(0.5)
+            end = time.time()
+
+        for i in range(1000):
+            for j in range(1, 26):
+                experts = model.model.layers[j].mlp.experts.generate_experts
+                weights = random_weights[i]
+                expert_ids = random_expert_ids[i]
+                input_tensor = random_input_tensor[i]
+                experts.cpu_infer.submit_with_cuda_stream(
+                    torch.cuda.current_stream(experts.out_device).cuda_stream,
+                    experts.moe.forward(
+                        1,
+                        expert_ids.size(0),
+                        expert_ids.data_ptr(),
+                        weights.data_ptr(),
+                        input_tensor.data_ptr(),
+                        output.data_ptr(),
+                    ),
+                )
+                experts.cpu_infer.sync_with_cuda_stream(
+                    torch.cuda.current_stream().cuda_stream
+                )
+    else:
+        generated = prefill_and_generate(
+            model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph
+        )
+
 
 if __name__ == "__main__":
-    fire.Fire(local_chat)
+    # fire.Fire(local_chat)
+    local_chat()

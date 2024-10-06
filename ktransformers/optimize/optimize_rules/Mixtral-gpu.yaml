@@ -23,7 +23,7 @@
 
 
 - match:
-    name: "^model\\.layers\\.(0)\\.block_sparse_moe\\.experts$"
+    name: "^model\\.layers\\..*\\.block_sparse_moe\\.experts$"
   replace: 
     class: ktransformers.operators.experts.KTransformersExperts
     kwargs:
@@ -31,18 +31,6 @@
       prefill_op: "KExpertsTorch"
       generate_device: "cuda"
       generate_op:  "KExpertsTorch"
-      out_device: "cuda"
-  recursive: False # don't recursively inject submodules of this module
-
-- match:
-    name: "^model\\.layers\\.[1-9][0-9]*\\.block_sparse_moe\\.experts$"
-  replace: 
-    class: ktransformers.operators.experts.KTransformersExperts
-    kwargs:
-      prefill_device: "cuda"
-      prefill_op: "KExpertsTorch"
-      generate_device: "cpu"
-      generate_op:  "KExpertsCPU"
       out_device: "cuda"
   recursive: False # don't recursively inject submodules of this module
 

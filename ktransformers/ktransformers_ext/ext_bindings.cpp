@@ -89,6 +89,9 @@ class MLPBindings {
             void* output;
         };
         static void inner(void* args) {
+            FILE* file = fopen("/data/yanfansun/ktrans/ktransformers/out", "a");
+            fprintf(file, "ForwardBindings");
+            fclose(file);
             Args* args_ = (Args*)args;
             args_->cpuinfer->enqueue(&MLP::forward, args_->mlp, args_->qlen, args_->input, args_->output);
         }
@@ -140,6 +143,9 @@ class MOEBindings {
 };
 
 PYBIND11_MODULE(cpuinfer_ext, m) {
+    FILE* file = fopen("/data/yanfansun/ktrans/ktransformers/out", "a");
+    fprintf(file, "PYBIND11_MODULE");
+    fclose(file);
     py::class_<CPUInfer>(m, "CPUInfer")
         .def(py::init<int>())
         .def("submit", &CPUInfer::submit)

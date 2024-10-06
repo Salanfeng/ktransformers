@@ -29,8 +29,8 @@
     kwargs:
       prefill_device: "cuda:0"
       prefill_op: "KExpertsTorch"
-      generate_device: "cpu"
-      generate_op:  "KExpertsCPU"
+      generate_device: "cuda:0"
+      generate_op:  "KExpertsTorch"
       out_device: "cuda:0"
   recursive: False # don't recursively inject submodules of this module
 

@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 import KTransformersOps 
 from ktransformers.util.custom_gguf import GGUFLoader
-from ktransformers.util.utils import InferenceState
+from ktransformers.util.utils import InferenceState,nested_flatten,nested_pack
 from ktransformers.ktransformers_ext.operators.custom_marlin.quantize.utils.marlin_utils import (
     MarlinWorkspace,
     marlin_quantize,
@@ -27,6 +27,8 @@ from ktransformers.operators.base_operator import BaseInjectedModule
 from transformers.configuration_utils import PretrainedConfig
 from abc import ABC, abstractmethod
 import sys, os
+import typing as tp
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Release"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Debug"))
@@ -156,6 +158,83 @@ class KLinearTorch(KLinearBase):
             self.w = None
         if self.has_bias:
             self.bias = None
+
+class KLinearWarpper(KLinearTorch):
+    def __init__(
+        self,
+        key: str,
+        gguf_loader: GGUFLoader,
+        config: PretrainedConfig,
+        orig_module: nn.Module = None,
+        device: str = "cuda",
+        **kwargs,
+    ):
+        super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
+        self.storage = self.replace_layer_storage(device=self.device)
+        self._register_state_dict_hook(self._add_storage_to_state_dict_hook)
+        self._register_load_state_dict_pre_hook(self._load_storage_from_state_dict_hook)
+
+    @staticmethod
+    def _add_storage_to_state_dict_hook(self, state_dict, prefix, local_metadata):
+        state_dict[prefix + 'storage'] = torch.as_tensor(self.storage, dtype=torch.uint8)
+        return state_dict
+
+    def _load_storage_from_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        self.storage.copy_(state_dict[prefix + 'storage'].storage().untyped())
+        del state_dict[prefix + 'storage']
+
+    @staticmethod
+    def replace_layer_storage(
+        self,
+        device: torch.device,
+    ):
+        # layer -> self
+
+        state_dict = {"w": self.w}
+        if self.has_bias:
+            state_dict["bias"] = self.bias
+
+        storage_size = 0
+        offsets = [0]
+
+        for x in nested_flatten(state_dict):
+            if not isinstance(x, torch.Tensor):
+                continue
+            storage_size += x.nbytes
+            offsets.append(storage_size)
+        
+        storage = torch.UntypedStorage(storage_size, device=device)
+
+        i = 0
+        new_flattened_states = list()
+        for x in nested_flatten(state_dict):
+            if not isinstance(x, torch.Tensor):
+                new_flattened_states.append(x)
+                continue
+            start = offsets[i]
+            end = offsets[i + 1]
+            a_view = torch.as_tensor(storage[start:end], dtype=x.dtype, device=device).view(x.shape)
+            a_view[...] = x
+            assert a_view.data_ptr() == storage.data_ptr() + start
+            i += 1
+            new_flattened_states.append(a_view)
+
+        state_dict = nested_pack(new_flattened_states, state_dict)
+
+        self.w = state_dict["w"]
+        if self.has_bias:
+            self.bias = state_dict["bias"]
+
+        return storage
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)
+
+    def load(self, w: dict | nn.Parameter | tuple | None = None, device: str|None = None):
+        return super().load(w=w, device=device)
+
+    def unload(self):
+        return super().unload()
 
 
 class KLinearMarlin(KLinearBase):
@@ -315,7 +394,7 @@ class KLinearCPUInfer(KLinearBase):
             return output
 
     def load(self, w: dict | nn.Parameter | tuple | None = None, device: str|None = None, warmup:bool = True):
-        print(f"loading {self.key} to {self.device} using CPUInfer")
+        # print(f"loading {self.key} to {self.device} using CPUInfer")
         if device is None: device = self.device
         self.load_weights(w=w, device=device)
         if self.bias is not None:

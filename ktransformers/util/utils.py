@@ -55,7 +55,7 @@ def get_all_used_cuda_device(device_map:dict):
     all_device_list = list(all_device_list)
     return all_device_list
 
-def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str = ""):
+def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str = "", target_device = None):
     prefix = prefix.replace("orig_module.", "")
     persistent_buffers = {k: v for k, v in module._buffers.items() if k not in module._non_persistent_buffers_set}
     local_name_params = itertools.chain(module._parameters.items(), persistent_buffers.items())
@@ -65,8 +65,8 @@ def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str 
         translated_key = translate_name_to_gguf(key)
         if translated_key in gguf_loader.tensor_file_map:
             target_dtype = torch.get_default_dtype()
-            device = get_device(translated_key[:translated_key.rfind(".")], gguf_loader.tensor_device_map)
-            print(f"loading {translated_key} to {device}")
+            device = get_device(translated_key[:translated_key.rfind(".")], gguf_loader.tensor_device_map) if target_device is None else target_device
+            # print(f"loading {translated_key} to {device}")
             # device = "cpu" if "embd" in translated_key else "cuda"
             weights = gguf_loader.load_gguf_tensor(translated_key, device = device).to(dtype = target_dtype)
             set_param(module, name, weights)
@@ -75,14 +75,58 @@ def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str 
             #print(load_config.tensor_file_map.keys())
             raise Exception(f"can't find {translated_key} in GGUF file!")
         
-def load_weights(module:nn.Module, gguf_loader:GGUFLoader, prefix=''):
+def load_weights(module:nn.Module, gguf_loader:GGUFLoader, prefix='', target_device = None):
     # print(f"recursively loading weights {prefix},{return_when_injected=}, {only_load_injected=}")
     if not isinstance(module, base_operator.BaseInjectedModule):
-        load_cur_state_dict(module, gguf_loader, prefix)
+        load_cur_state_dict(module, gguf_loader, prefix, target_device)
         for name, child in module._modules.items():
-            load_weights(child, gguf_loader, prefix+name+".")
+            load_weights(child, gguf_loader, prefix+name+".", target_device)
     else:
         module.load()
+
+def nested_flatten(t):
+    """
+    Turn nested list/tuple/dict into a flat iterator.
+    """
+    if isinstance(t, (list, tuple)):
+        for x in t:
+            yield from nested_flatten(x)
+    elif isinstance(t, dict):
+        for k, v in sorted(t.items()):
+            yield from nested_flatten(v)
+    else:
+        yield t
+
+def nested_pack(flat, structure):
+    """
+    Restore nested structure from flattened state
+    :param flat: result of nested_flatten
+    :param structure: used as example when recovering structure
+    :returns: nested structure like :structure: filled with elements of :flat:
+    """
+    return _nested_pack(iter(flat), structure)
+
+
+def _nested_pack(flat_iter, structure):
+    if is_namedtuple(structure):
+        return type(structure)(*[_nested_pack(flat_iter, x) for x in structure])
+    elif isinstance(structure, (list, tuple)):
+        return type(structure)(_nested_pack(flat_iter, x) for x in structure)
+    elif isinstance(structure, dict):
+        return {k: _nested_pack(flat_iter, v) for k, v in sorted(structure.items())}
+    else:
+        return next(flat_iter)
+
+def is_namedtuple(x):
+    """Checks if x is a namedtuple instance. Taken from https://stackoverflow.com/a/2166841 ."""
+    t = type(x)
+    b = t.__bases__
+    if len(b) != 1 or b[0] != tuple:
+        return False
+    f = getattr(t, "_fields", None)
+    if not isinstance(f, tuple):
+        return False
+    return all(type(n) == str for n in f)
 
 def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cuda_graph: bool = True):
     import os

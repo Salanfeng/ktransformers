@@ -30,6 +30,7 @@ class Config(metaclass=Singleton):
             os.path.dirname(os.path.dirname(__file__)))
         config_yaml: str = os.path.join(
             base_path, "configs", Config.CONFIG_FILE_NAME)
+        print(f"config file path: {config_yaml}")
         if not os.path.exists(config_yaml):
             print(f"Can't find config file, {config_yaml}")
             exit(-1)

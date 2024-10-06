@@ -64,6 +64,9 @@ void Linear::forward_many(int qlen, const void* input, void* output, Backend* ba
 }
 
 void Linear::forward(int qlen, const void* input, void* output, Backend* backend) {
+    FILE* file = fopen("/data/yanfansun/ktrans/ktransformers/out", "a");
+            fprintf(file, "Linear::forward");
+            fclose(file);
     if (qlen <= 0) {
         return;
     }

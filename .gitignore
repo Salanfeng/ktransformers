@@ -17,4 +17,7 @@ compile_commands.json
 *dist/
 ktransformers/server/local_store/
 ktransformers/server_test1.db
-*.patch
+*.pt
+vtune_result*
+*-GGUF
+lm-evaluation*

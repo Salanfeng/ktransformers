@@ -71,6 +71,9 @@ void MLP::forward_many(int qlen, const void* input, void* output, Backend* backe
             }
         }
     }
+
+
+
     int nth = config_.intermediate_size / config_.stride;
     backend->do_work_stealing_job(nth, [&](int task_id) {
         int ith = task_id;
