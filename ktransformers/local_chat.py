@@ -79,10 +79,10 @@ def local_chat(
     use_cuda_graph: bool = False,
 ):
     start = time.time()
-    # model_path = "/opt/pretrained_models/DeepSeek-V2-Lite-Chat"
-    # gguf_path = "/data/yanfansun/ktrans/ktransformers/DeepSeek-V2-Lite-Chat-GGUF"
-    model_path = "/opt/pretrained_models/Mixtral-8x7B-Instruct-v0.1"
-    gguf_path = "/data/yanfansun/ktrans/ktransformers/Mixtral-GGUF"
+    model_path = "/opt/pretrained_models/DeepSeek-V2-Lite-Chat"
+    gguf_path = "/data/yanfansun/ktrans/ktransformers/DeepSeek-V2-Lite-Chat-GGUF"
+    # model_path = "/opt/pretrained_models/Mixtral-8x7B-Instruct-v0.1"
+    # gguf_path = "/data/yanfansun/ktrans/ktransformers/Mixtral-GGUF"
     # model_path = "/opt/pretrained_models/Qwen2-57B-A14B-Instruct"
     # gguf_path = "/data/yanfansun/ktrans/ktransformers/Qwen-GGUF"
     torch.set_grad_enabled(False)

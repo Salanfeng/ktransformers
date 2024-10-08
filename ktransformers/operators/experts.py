@@ -702,9 +702,7 @@ class KExpertsTorch(KExpertsBase):
         self.device = device
         self.dtype = torch.get_default_dtype()
         self.cache = KExpertsCache(
-            expert_num=n_routed_experts * (config.num_hidden_layers - 1),
-            hidden_dim=config.hidden_size,
-            moe_intermediate_size=config.moe_intermediate_size,
+            config=config,
             dtype=self.dtype,
         )
 
@@ -816,22 +814,22 @@ class KExpertsCache:
                 self.expert_num = config.n_routed_experts * (
                     config.num_hidden_layers - 1
                 )
-                self.hidden_dim = config.hidden_dim
+                self.hidden_size = config.hidden_size
                 self.moe_intermediate_size = config.moe_intermediate_size
             elif hasattr(config, "num_local_experts"):
                 self.expert_num = config.num_local_experts * (
                     config.num_hidden_layers - 1
                 )
-                self.hidden_dim = config.hidden_size
+                self.hidden_size = config.hidden_size
                 self.moe_intermediate_size = config.intermediate_size
             else:
                 raise ValueError(
                     "config must have n_routed_experts or num_local_experts"
                 )
 
-            self.gate_shape = torch.Size([self.moe_intermediate_size, self.hidden_dim])
-            self.up_shape = torch.Size([self.moe_intermediate_size, self.hidden_dim])
-            self.down_shape = torch.Size([self.hidden_dim, self.moe_intermediate_size])
+            self.gate_shape = torch.Size([self.moe_intermediate_size, self.hidden_size])
+            self.up_shape = torch.Size([self.moe_intermediate_size, self.hidden_size])
+            self.down_shape = torch.Size([self.hidden_size, self.moe_intermediate_size])
             # 如果没有指定设备，默认使用 cuda 0 load专家
             if devices is None:
                 devices = ["cuda:0"]
@@ -841,19 +839,19 @@ class KExpertsCache:
             # 内存，存储所有专家
             self.gate_storage = [
                 torch.UntypedStorage(
-                    dtype.itemsize * self.moe_intermediate_size * self.hidden_dim
+                    dtype.itemsize * self.moe_intermediate_size * self.hidden_size
                 ).pin_memory()
                 for _ in range(self.expert_num)
             ]
             self.up_storage = [
                 torch.UntypedStorage(
-                    dtype.itemsize * self.moe_intermediate_size * self.hidden_dim
+                    dtype.itemsize * self.moe_intermediate_size * self.hidden_size
                 ).pin_memory()
                 for _ in range(self.expert_num)
             ]
             self.down_storage = [
                 torch.UntypedStorage(
-                    dtype.itemsize * self.hidden_dim * self.moe_intermediate_size
+                    dtype.itemsize * self.hidden_size * self.moe_intermediate_size
                 ).pin_memory()
                 for _ in range(self.expert_num)
             ]
