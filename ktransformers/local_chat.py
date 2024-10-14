@@ -121,8 +121,10 @@ def local_chat(
         )
 
     load_size = [8] * config.num_hidden_layers
-
+    start = time.time()
     optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config, load_size = load_size)
+    end = time.time()
+    print("optimize_and_load_gguf time:", end - start)
     model.generation_config = GenerationConfig.from_pretrained(model_path)
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
@@ -132,7 +134,6 @@ def local_chat(
 
     if use_gpu:
         print("using gpu")
- 
     else:
         print("using cpu")
 
