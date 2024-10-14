@@ -119,12 +119,16 @@ def local_chat(
         gguf_path = input(
             "please input the path of your gguf file(gguf file in the dir containing input gguf file must all belong to current model):"
         )
-
-    load_size = [8] * config.num_hidden_layers
+    # 储存每层cache的大小
+    load_size = [16] * config.num_hidden_layers
+    print("load_size:", load_size)
     start = time.time()
-    optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config, load_size = load_size)
+    cache = optimize_and_load_gguf(
+        model, optimize_rule_path, gguf_path, config, load_size=load_size
+    )
     end = time.time()
     print("optimize_and_load_gguf time:", end - start)
+
     model.generation_config = GenerationConfig.from_pretrained(model_path)
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
@@ -137,24 +141,7 @@ def local_chat(
     else:
         print("using cpu")
 
-    system = platform.system()
     content = "请说出2的1到10次方"
-
-    def get_model_size(model):
-        # 获取模型所有参数的大小（以字节为单位）
-        param_size = sum(
-            param.numel() * param.element_size() for param in model.parameters()
-        )
-        buffer_size = sum(
-            buffer.numel() * buffer.element_size() for buffer in model.buffers()
-        )
-        total_size = param_size + buffer_size
-
-        # 将字节转换为 GB
-        total_size_gb = total_size / (1024**3)
-        return total_size_gb
-
-    print("model size:", get_model_size(model))
 
     messages = [{"role": "user", "content": content}]
     input_tensor = tokenizer.apply_chat_template(
@@ -212,6 +199,17 @@ def local_chat(
     else:
         generated = prefill_and_generate(
             model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph
+        )
+        hits, misses, get_time, load_time = cache.get_hits_and_misses()
+        print(
+            "hits:",
+            hits,
+            "misses:",
+            misses,
+            "get_time:",
+            get_time,
+            "load_time:",
+            load_time,
         )
 
 

@@ -209,6 +209,8 @@ def optimize_and_load_gguf(
             dtype=torch.get_default_dtype(),
             devices_usage=device_usage,
         )
+    else:
+        cache = None
 
     model_config = translate_model_config(model_config)
 
@@ -220,6 +222,7 @@ def optimize_and_load_gguf(
     module.gguf_loader = gguf_loader
     del_meta(module)
     torch.cuda.empty_cache()
+    return cache
 
 
 def get_device_usage(optimize_config):
