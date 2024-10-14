@@ -1034,12 +1034,12 @@ class KExpertsCache:
         if len(expert_idxs) > self.load_size[layer_idx]:
             deepcopy = True
         else:
-            deepcopy = True
+            deepcopy = False
         for expert_idx in expert_idxs:
             self.usage_count[layer_idx][expert_idx] += 1
             experts[expert_idx] = self.get_expert_weights(
                 expert_idx + (layer_idx - 1) * self.expert_num_per_layer,
-                deepcopy=True,
+                deepcopy=deepcopy,
             )
         # next_layer = layer_idx + 1 if layer_idx + 1 < len(self.load_size) else 1
         # self.prefetch_expert(next_layer)
