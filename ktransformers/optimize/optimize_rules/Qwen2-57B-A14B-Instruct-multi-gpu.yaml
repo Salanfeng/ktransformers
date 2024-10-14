@@ -33,7 +33,6 @@
       generate_op:  "KExpertsTorch"
       out_device: "cuda:0"
   recursive: False # don't recursively inject submodules of this module
-
 - match:
     name: "^model\\.layers\\.([12][0-9]|[3-9])\\."
     class: ktransformers.models.modeling_qwen2_moe.Qwen2MoeRotaryEmbedding

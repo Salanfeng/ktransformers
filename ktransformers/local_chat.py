@@ -37,7 +37,6 @@ from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
 from ktransformers.models.modeling_mixtral import MixtralForCausalLM
 from ktransformers.util.utils import prefill_and_generate
 from ktransformers.server.config.config import Config
-from ktransformers.operators.experts import KExpertsCache
 from pympler import asizeof
 
 custom_models = {
@@ -58,7 +57,6 @@ default_optimize_rules = {
         if use_gpu
         else ktransformer_rules_dir + "DeepSeek-V2-Chat.yaml"
     ),
-    # + "DeepSeek-V2-Lite-Chat-multi-gpu.yaml",
     "Qwen2MoeForCausalLM": ktransformer_rules_dir
     + "Qwen2-57B-A14B-Instruct-multi-gpu.yaml",
     "MixtralForCausalLM": (
@@ -122,25 +120,21 @@ def local_chat(
             "please input the path of your gguf file(gguf file in the dir containing input gguf file must all belong to current model):"
         )
 
-    # KExpertsCache 单例模式
-    if use_gpu:
-        print("using gpu")
-        cache = KExpertsCache(
-            config=config,
-            load_size=32,  # 不能少于64
-            dtype=torch.get_default_dtype(),
-            devices=["cuda:0"],
-        )
-    else:
-        print("using cpu")
+    load_size = [8] * config.num_hidden_layers
 
-    optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config)
+    optimize_and_load_gguf(model, optimize_rule_path, gguf_path, config, load_size = load_size)
     model.generation_config = GenerationConfig.from_pretrained(model_path)
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
     model.eval()
 
     logging.basicConfig(level=logging.INFO)
+
+    if use_gpu:
+        print("using gpu")
+ 
+    else:
+        print("using cpu")
 
     system = platform.system()
     content = "请说出2的1到10次方"

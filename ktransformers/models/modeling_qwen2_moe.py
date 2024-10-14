@@ -862,7 +862,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
-attn_time = []
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen2MoeConfig, layer_idx: int):
         super().__init__()
@@ -919,7 +918,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        start = time.time()
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -929,9 +927,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
         )
-        end = time.time()
-        attn_time.append(end - start)
-        print(f"Self Attention avg Time: {sum(attn_time) / len(attn_time)}")
         hidden_states = residual + hidden_states
 
         # Fully Connected

@@ -10,6 +10,7 @@ LastEditTime : 2024-08-15 02:36:29
 Copyright (c) 2024 by KVCache.AI, All Rights Reserved. 
 """
 
+import threading
 from typing import Any, Union
 import numpy as np
 import numpy.typing as npt
@@ -765,14 +766,38 @@ class KExpertsTorch(KExpertsBase):
 
         # 提前加载需要使用的专家权重
         expert_weights = {}
-        for expert_idx in unique_selected_experts:
+        load_threads = []
+
+        def load_expert_weights(expert_idx):
             expert_idx = expert_idx.item()
             expert_weights[expert_idx] = self.cache.get_expert_weights(
                 expert_idx + (self.layer_idx - 1) * self.expert_num,
             )
 
+        # 启动第一个专家的加载线程
+        if unique_selected_experts:
+            first_expert_idx = unique_selected_experts[0]
+            thread = threading.Thread(
+                target=load_expert_weights, args=(first_expert_idx,)
+            )
+            load_threads.append(thread)
+            thread.start()
+
         # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in unique_selected_experts:
+        for i, expert_idx in enumerate(unique_selected_experts):
+            # 等待当前专家的权重加载完成
+            load_threads[i].join()
+
+            # 启动下一个专家的加载线程
+            if i + 1 < len(unique_selected_experts):
+                next_expert_idx = unique_selected_experts[i + 1]
+                thread = threading.Thread(
+                    target=load_expert_weights, args=(next_expert_idx,)
+                )
+                load_threads.append(thread)
+                thread.start()
+
+            # 执行当前专家的计算
             idx, top_x = torch.where(expert_mask[expert_idx])
             current_state = hidden_states_cpu[None, top_x].reshape(-1, hidden_dim)
 
@@ -802,13 +827,21 @@ class KExpertsCache:
     def __init__(
         self,
         config: PretrainedConfig,
-        load_size=512,
+        load_size=None,
         dtype=torch.get_default_dtype(),
-        devices=None,
+        devices_usage=None,
     ):
         if not hasattr(self, "initialized"):
             # 如果config有n_routed_experts
-            self.load_size = load_size
+            if load_size is None:
+                from math import sqrt
+
+                self.load_size = [int(sqrt(config.n_routed_experts))] * (
+                    config.num_hidden_layers
+                )
+                self.load_size[0] = 0
+            else:
+                self.load_size = load_size
             self.dtype = dtype
             if hasattr(config, "n_routed_experts"):
                 self.expert_num = config.n_routed_experts * (
@@ -822,20 +855,30 @@ class KExpertsCache:
                 )
                 self.hidden_size = config.hidden_size
                 self.moe_intermediate_size = config.intermediate_size
+            elif hasattr(config, "num_experts"):
+                self.expert_num = config.num_experts * (config.num_hidden_layers - 1)
+                self.hidden_size = config.hidden_size
+                self.moe_intermediate_size = config.intermediate_size
             else:
                 raise ValueError(
-                    "config must have n_routed_experts or num_local_experts"
+                    "config error, n_routed_experts or num_local_experts or num_experts not found"
                 )
 
             self.gate_shape = torch.Size([self.moe_intermediate_size, self.hidden_size])
             self.up_shape = torch.Size([self.moe_intermediate_size, self.hidden_size])
             self.down_shape = torch.Size([self.hidden_size, self.moe_intermediate_size])
             # 如果没有指定设备，默认使用 cuda 0 load专家
-            if devices is None:
-                devices = ["cuda:0"]
-            self.devices = devices
-            self.num_devices = len(devices)
-
+            if devices_usage is None:
+                devices_usage = {}
+                devices_usage["cuda:0"] = [
+                    i for i in range(1, config.num_hidden_layers)
+                ]
+                # devices存的是每个设备上的层索引
+            self.devices_usage = devices_usage
+            self.layer2device = {}
+            for device, layers in devices_usage.items():
+                for layer in layers:
+                    self.layer2device[layer] = device
             # 内存，存储所有专家
             self.gate_storage = [
                 torch.UntypedStorage(
@@ -860,35 +903,57 @@ class KExpertsCache:
             self.gate_memory = [
                 [
                     torch.empty(self.gate_shape, dtype=dtype, device=device)
-                    for _ in range(load_size // self.num_devices)
+                    for _ in sum(
+                        self.load_size[idx] for idx in self.devices_usage[device]
+                    )
                 ]
-                for device in devices
+                for device in devices_usage
             ]
             self.up_memory = [
                 [
                     torch.empty(self.up_shape, dtype=dtype, device=device)
-                    for _ in range(load_size // self.num_devices)
+                    for _ in sum(
+                        self.load_size[idx] for idx in self.devices_usage[device]
+                    )
                 ]
-                for device in devices
+                for device in devices_usage
             ]
             self.down_memory = [
                 [
                     torch.empty(self.down_shape, dtype=dtype, device=device)
-                    for _ in range(load_size // self.num_devices)
+                    for _ in sum(
+                        self.load_size[idx] for idx in self.devices_usage[device]
+                    )
                 ]
-                for device in devices
+                for device in devices_usage
             ]
 
             # 当前加载到显存中的专家索引和位置
             self.loaded_experts_idx = {}
-            self.free_memory_slots = {
-                device: list(range(load_size // self.num_devices)) for device in devices
-            }
+            for device, layers in self.devices_usage.items():
+                self.loaded_experts_idx[device] = {}
+                for layer in layers:
+                    self.loaded_experts_idx[device][layer] = {}
+            self.free_memory_slots = self.initialize_free_memory_slots()
 
             # CUDA Stream
             self.copy_stream = torch.cuda.Stream()
 
             self.initialized = True
+
+    def initialize_free_memory_slots(self):
+        # 每个device有连续的索引，按照专家数量依次分配
+        free_memory_slots = {}
+        for device, layers in self.devices_usage.items():
+            free_memory_slots[device] = {}
+            current_index = 0
+            for layer in self.devices[device]:
+                next_index = current_index + self.load_size[layer]
+                free_memory_slots[device][layer] = list(
+                    range(current_index, next_index)
+                )
+                current_index = next_index
+        return free_memory_slots
 
     def weight_to_storage(self, weight, dtype=torch.float16, device="cpu"):
         weight = weight.to(dtype)
@@ -905,36 +970,41 @@ class KExpertsCache:
         weight = torch.as_tensor(storage, dtype=dtype, device=device).view(shape)
         return weight
 
-    def load_expert_weights(self, expert_idx):
+    def load_expert_weights(self, expert_idx, init=False):
         # 找位置
-        for device, slots in self.free_memory_slots.items():
-            if slots:
-                break
-        else:
+        layer_idx = expert_idx // self.expert_num
+        device = self.layer2device[layer_idx]
+        if not self.free_memory_slots[device][layer_idx]:
+            if not init:
+                return
             # 如果没有空闲位置，卸载一个已有的专家权重(用LRU)
-            device = next(iter(self.loaded_experts_idx))
-            self.unload_expert_weights(next(iter(self.loaded_experts_idx[device])))
+            # TODO better LRU
+            offload_expert = next(iter(self.loaded_experts_idx[device][layer_idx]))
+            self.unload_expert_weights(
+                offload_expert,
+                device,
+                layer_idx,
+            )
 
         # 空闲位置
-        memory_slot = self.free_memory_slots[device].pop(0)
-
+        memory_slot = self.free_memory_slots[device][layer_idx].pop(0)
         # 用 CUDA Stream
         with torch.cuda.stream(self.copy_stream):
-            self.gate_memory[self.devices.index(device)][memory_slot].copy_(
+            self.gate_memory[device][memory_slot].copy_(
                 self.storage_to_weight(
                     storage=self.gate_storage[expert_idx],
                     shape=self.gate_shape,
                     dtype=self.dtype,
                 )
             )
-            self.up_memory[self.devices.index(device)][memory_slot].copy_(
+            self.up_memory[device][memory_slot].copy_(
                 self.storage_to_weight(
                     storage=self.up_storage[expert_idx],
                     shape=self.up_shape,
                     dtype=self.dtype,
                 )
             )
-            self.down_memory[self.devices.index(device)][memory_slot].copy_(
+            self.down_memory[device][memory_slot].copy_(
                 self.storage_to_weight(
                     storage=self.down_storage[expert_idx],
                     shape=self.down_shape,
@@ -943,38 +1013,27 @@ class KExpertsCache:
             )
 
         # 记录加载的专家索引和位置
-        if device not in self.loaded_experts_idx:
-            self.loaded_experts_idx[device] = {}
-        self.loaded_experts_idx[device][expert_idx] = memory_slot
+        self.loaded_experts_idx[device][layer_idx][expert_idx] = memory_slot
 
-    def unload_expert_weights(self, expert_idx):
+    def unload_expert_weights(self, expert_idx, device, layer_idx):
         # 获取专家在显存中的位置
-        for device, experts in self.loaded_experts_idx.items():
-            if expert_idx in experts:
-                memory_slot = experts.pop(expert_idx)
-                # 将位置标记为空闲
-                self.free_memory_slots[device].append(memory_slot)
-                break
+        memory_slot = self.loaded_experts_idx[device][layer_idx][expert_idx]
+        self.free_memory_slots[device][layer_idx].append(memory_slot)
 
     def get_expert_weights(self, expert_idx):
-        for device, experts in self.loaded_experts_idx.items():
-            if expert_idx in experts:
-                # 将已加载的专家权重移动到字典的末尾(LRU更新)
-                self.loaded_experts_idx[device][expert_idx] = self.loaded_experts_idx[
-                    device
-                ].pop(expert_idx)
-                memory_slot = self.loaded_experts_idx[device][expert_idx]
-                return (
-                    self.gate_memory[self.devices.index(device)][memory_slot].view(
-                        self.gate_shape
-                    ),
-                    self.up_memory[self.devices.index(device)][memory_slot].view(
-                        self.up_shape
-                    ),
-                    self.down_memory[self.devices.index(device)][memory_slot].view(
-                        self.down_shape
-                    ),
-                )
+        layer = expert_idx // self.expert_num
+        device = self.layer2device[layer]
+        if expert_idx in self.loaded_experts_idx[device][layer].keys():
+            # 将已加载的专家权重移动到字典的末尾(LRU更新)
+            self.loaded_experts_idx[device][layer][expert_idx] = (
+                self.loaded_experts_idx[device][layer].pop(expert_idx)
+            )
+            memory_slot = self.loaded_experts_idx[device][layer][expert_idx]
+            return (
+                self.gate_memory[device][memory_slot].view(self.gate_shape),
+                self.up_memory[device][memory_slot].view(self.up_shape),
+                self.down_memory[device][memory_slot].view(self.down_shape),
+            )
         self.load_expert_weights(expert_idx)
         return self.get_expert_weights(expert_idx)
 
@@ -987,14 +1046,15 @@ class KExpertsCache:
         self.up_storage[expert_idx].copy_(up)
         self.down_storage[expert_idx].copy_(down)
 
-        for device, slots in self.free_memory_slots.items():
-            if slots:
-                self.load_expert_weights(expert_idx)
-                break
+        # 如果有空位，先加载到显存中
+        self.load_expert_weights(expert_idx, init=True)
 
     @classmethod
     def destroy_instance(cls):
         cls._instance = None
+
+
+
 
 
 EXPERTS_MAP = {
