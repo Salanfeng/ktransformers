@@ -202,6 +202,7 @@ def optimize_and_load_gguf(
     )
 
     device_usage, use_gpu = get_device_usage(optimize_config)
+    t1 = time.time()
     if use_gpu:
         cache = KExpertsCache(
             config=model_config,
@@ -211,6 +212,8 @@ def optimize_and_load_gguf(
         )
     else:
         cache = None
+    t2 = time.time()
+    print(f"KExpertsCache init time: {t2-t1}")
 
     model_config = translate_model_config(model_config)
 

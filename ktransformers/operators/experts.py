@@ -10,6 +10,7 @@ LastEditTime : 2024-08-15 02:36:29
 Copyright (c) 2024 by KVCache.AI, All Rights Reserved. 
 """
 
+import json
 import threading
 from typing import Any, Union
 import numpy as np
@@ -669,7 +670,7 @@ class KExpertsTorchBackup(KExpertsBase):
         #     # However `index_add_` only support torch tensors for indexing so we'll use
         #     # the `top_x` tensor here.
         #     final_hidden_states.index_add_(0, top_x, current_hidden_states)
-        print(f"KExpertsTorch forward time: {t2-t1} + {t3-t2}")
+        # print(f"KExpertsTorch forward time: {t2-t1} + {t3-t2}")
         return final_hidden_states.to(device=org_device, dtype=org_dtype)
 
 
@@ -700,6 +701,9 @@ class KExpertsTorch(KExpertsBase):
             config=config,
             dtype=self.dtype,
         )
+        self.loading_lock = [
+            [torch.cuda.Event() for _ in range(3)] for _ in range(self.expert_num)
+        ]
 
     def load(
         self,
@@ -711,7 +715,6 @@ class KExpertsTorch(KExpertsBase):
             device = self.device
         if w is None:
             w = self.load_weights(device=device)[self.key]
-
         if isinstance(w, dict):
             for expert_idx in range(self.expert_num):
                 self.cache.load_weights_to_storage(
@@ -758,20 +761,24 @@ class KExpertsTorch(KExpertsBase):
         # 只遍历selected_experts_cpu
         unique_selected_experts = torch.unique(selected_experts_cpu).tolist()
         # 提前加载需要使用的专家权重
+        self.cache.wait_prefetch()
         expert_weights = self.cache.get_experts_weights(
-            unique_selected_experts, self.layer_idx
+            unique_selected_experts, self.layer_idx, self.loading_lock
         )
+        # self.cache.prefetch_expert(layer_idx=self.layer_idx)
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in unique_selected_experts:
             idx, top_x = torch.where(expert_mask[expert_idx])
             current_state = hidden_states_cpu[None, top_x].reshape(-1, hidden_dim)
 
             gate_weight, up_weight, down_weight = expert_weights[expert_idx]
-
+            self.loading_lock[expert_idx][0].wait()
             G = current_state @ gate_weight.T
             A = self.act_fn(G)
+            self.loading_lock[expert_idx][1].wait()
             U = current_state @ up_weight.T
             H = A * U
+            self.loading_lock[expert_idx][2].wait()
             current_hidden_states = (
                 H @ down_weight.T * routing_weights_cpu[top_x, idx, None]
             )
@@ -810,21 +817,21 @@ class KExpertsCache:
             self.dtype = dtype
             if hasattr(config, "n_routed_experts"):
                 self.expert_num_per_layer = config.n_routed_experts
-                self.expert_total_num = config.n_routed_experts * (
+                self.total_expert_num = config.n_routed_experts * (
                     config.num_hidden_layers - 1
                 )
                 self.hidden_size = config.hidden_size
                 self.moe_intermediate_size = config.moe_intermediate_size
             elif hasattr(config, "num_local_experts"):
                 self.expert_num_per_layer = config.num_local_experts
-                self.expert_total_num = config.num_local_experts * (
+                self.total_expert_num = config.num_local_experts * (
                     config.num_hidden_layers - 1
                 )
                 self.hidden_size = config.hidden_size
                 self.moe_intermediate_size = config.intermediate_size
             elif hasattr(config, "num_experts"):
                 self.expert_num_per_layer = config.num_experts
-                self.expert_total_num = config.num_experts * (
+                self.total_expert_num = config.num_experts * (
                     config.num_hidden_layers - 1
                 )
                 self.hidden_size = config.hidden_size
@@ -854,59 +861,74 @@ class KExpertsCache:
                 dtype.itemsize * self.moe_intermediate_size * self.hidden_size
             )
             gate_large = torch.UntypedStorage(
-                size_per_expert * self.expert_total_num
+                size_per_expert * self.total_expert_num
             ).pin_memory()
             up_large = torch.UntypedStorage(
-                size_per_expert * self.expert_total_num
+                size_per_expert * self.total_expert_num
             ).pin_memory()
             down_large = torch.UntypedStorage(
-                size_per_expert * self.expert_total_num
+                size_per_expert * self.total_expert_num
             ).pin_memory()
 
             self.gate_storage = [
                 gate_large[i * size_per_expert : (i + 1) * size_per_expert]
-                for i in range(self.expert_total_num)
+                for i in range(self.total_expert_num)
             ]
             self.up_storage = [
                 up_large[i * size_per_expert : (i + 1) * size_per_expert]
-                for i in range(self.expert_total_num)
+                for i in range(self.total_expert_num)
             ]
             self.down_storage = [
                 down_large[i * size_per_expert : (i + 1) * size_per_expert]
-                for i in range(self.expert_total_num)
+                for i in range(self.total_expert_num)
             ]
 
             # 显存
             self.gate_memory = {}
             self.up_memory = {}
             self.down_memory = {}
+            self.gate_views = {}
+            self.up_views = {}
+            self.down_views = {}
             for device in devices_usage:
+                load_experts_num = sum(
+                    self.load_size[layer_idx]
+                    for layer_idx in self.devices_usage[device]
+                )
+                total_size = load_experts_num * size_per_expert
+                total_gate_memory = torch.UntypedStorage(total_size, device=device)
+                # 将gate_memory 切分为load_experts_num个专家
                 self.gate_memory[device] = [
-                    torch.empty(self.gate_shape, dtype=dtype, device=device)
-                    for _ in range(
-                        sum(
-                            self.load_size[layer_idx]
-                            for layer_idx in self.devices_usage[device]
-                        )
-                    )
+                    total_gate_memory[i * size_per_expert : (i + 1) * size_per_expert]
+                    for i in range(load_experts_num)
                 ]
+                self.gate_views[device] = [
+                    torch.as_tensor(storage, dtype=dtype, device=device).view(
+                        self.gate_shape
+                    )
+                    for storage in self.gate_memory[device]
+                ]
+                total_up_memory = torch.UntypedStorage(total_size, device=device)
                 self.up_memory[device] = [
-                    torch.empty(self.up_shape, dtype=dtype, device=device)
-                    for _ in range(
-                        sum(
-                            self.load_size[layer_idx]
-                            for layer_idx in self.devices_usage[device]
-                        )
-                    )
+                    total_up_memory[i * size_per_expert : (i + 1) * size_per_expert]
+                    for i in range(load_experts_num)
                 ]
-                self.down_memory[device] = [
-                    torch.empty(self.down_shape, dtype=dtype, device=device)
-                    for _ in range(
-                        sum(
-                            self.load_size[layer_idx]
-                            for layer_idx in self.devices_usage[device]
-                        )
+                self.up_views[device] = [
+                    torch.as_tensor(storage, dtype=dtype, device=device).view(
+                        self.up_shape
                     )
+                    for storage in self.up_memory[device]
+                ]
+                total_down_memory = torch.UntypedStorage(total_size, device=device)
+                self.down_memory[device] = [
+                    total_down_memory[i * size_per_expert : (i + 1) * size_per_expert]
+                    for i in range(load_experts_num)
+                ]
+                self.down_views[device] = [
+                    torch.as_tensor(storage, dtype=dtype, device=device).view(
+                        self.down_shape
+                    )
+                    for storage in self.down_memory[device]
                 ]
 
             # 当前加载到显存中的专家索引和位置
@@ -920,11 +942,17 @@ class KExpertsCache:
             # CUDA Stream
             self.copy_stream = torch.cuda.Stream()
             # 专家使用次数
-            self.usage_count = {}
+            self.usage_count = []
             for layer in range(0, config.num_hidden_layers):
-                self.usage_count[layer] = [0] * self.expert_num_per_layer
+                self.usage_count.append([0] * self.expert_num_per_layer)
                 self.usage_count[layer][0] = -1
-            self.prefetch_lock = torch.cuda.Event()
+            # with open("usage.json", "r") as f:
+            #     self.usage_count = json.load(f)
+            self.prefetch_size = 1
+            self.prefetch_lock = [
+                [torch.cuda.Event() for _ in range(3)]
+                for _ in range(self.prefetch_size)
+            ]
             self.prefetching = False
             self.hits = 0
             self.misses = 0
@@ -959,7 +987,9 @@ class KExpertsCache:
         weight = torch.as_tensor(storage, dtype=dtype, device=device).view(shape)
         return weight
 
-    def load_expert_weights(self, expert_idx, init=False):
+    def load_expert_weights(
+        self, expert_idx, init=False, non_blocking=True, loading_lock=None
+    ):
         # 找位置
         layer_idx = expert_idx // self.expert_num_per_layer
         device = self.layer2device[layer_idx]
@@ -980,27 +1010,20 @@ class KExpertsCache:
         # 用 CUDA Stream
         with torch.cuda.stream(self.copy_stream):
             self.gate_memory[device][memory_slot].copy_(
-                self.storage_to_weight(
-                    storage=self.gate_storage[expert_idx],
-                    shape=self.gate_shape,
-                    dtype=self.dtype,
-                )
+                self.gate_storage[expert_idx],
+                non_blocking=non_blocking,
             )
+            loading_lock[0].record()
             self.up_memory[device][memory_slot].copy_(
-                self.storage_to_weight(
-                    storage=self.up_storage[expert_idx],
-                    shape=self.up_shape,
-                    dtype=self.dtype,
-                )
+                self.up_storage[expert_idx],
+                non_blocking=non_blocking,
             )
+            loading_lock[1].record()
             self.down_memory[device][memory_slot].copy_(
-                self.storage_to_weight(
-                    storage=self.down_storage[expert_idx],
-                    shape=self.down_shape,
-                    dtype=self.dtype,
-                )
+                self.down_storage[expert_idx],
+                non_blocking=non_blocking,
             )
-
+            loading_lock[2].record()
         # 记录加载的专家索引和位置
         self.loaded_experts_idx[device][layer_idx][expert_idx] = memory_slot
 
@@ -1015,16 +1038,12 @@ class KExpertsCache:
         self.free_memory_slots[device][layer_idx].append(memory_slot)
         self.loaded_experts_idx[device][layer_idx].pop(expert_idx)
 
-    def get_experts_weights(self, expert_idxs, layer_idx):
-        # if self.prefetching:
-        #     self.prefetch_lock.wait()
-        #     self.prefetching = False
-
+    def get_experts_weights(self, expert_idxs, layer_idx, loading_lock):
         # prefetch_experts = sorted(
         #     enumerate(self.usage_count[layer_idx]),
         #     key=lambda x: x[1],
         #     reverse=True,
-        # )[:3]
+        # )[:self.prefetch_size]
         # for expert_idx, _ in prefetch_experts:
         #     if expert_idx in expert_idxs:
         #         self.hits += 1
@@ -1035,20 +1054,56 @@ class KExpertsCache:
             deepcopy = True
         else:
             deepcopy = False
+        # load_idxs = []
+        # unload_idxs = []
+        # for expert_idx in expert_idxs:
+        #     self.usage_count[layer_idx][expert_idx] += 1
+        #     device = self.layer2device[layer_idx]
+        #     if expert_idx in self.loaded_experts_idx[device][layer_idx].keys():
+        #         load_idxs.append(expert_idx)
+        #     else:
+        #         unload_idxs.append(expert_idx)
+
         for expert_idx in expert_idxs:
-            self.usage_count[layer_idx][expert_idx] += 1
             experts[expert_idx] = self.get_expert_weights(
                 expert_idx + (layer_idx - 1) * self.expert_num_per_layer,
                 deepcopy=deepcopy,
+                loading_lock=loading_lock[expert_idx],
             )
-        # next_layer = layer_idx + 1 if layer_idx + 1 < len(self.load_size) else 1
-        # self.prefetch_expert(next_layer)
         return experts
 
+    def prefetch_expert(self, layer_idx):
+        next_layer = layer_idx + 1 if layer_idx + 1 < len(self.load_size) else 1
+        self.prefetching = True
+        # 取使用最多的prefetch_size个expert
+        # TODO better strategy
+        experts = sorted(
+            enumerate(self.usage_count[next_layer]),
+            key=lambda x: x[1],
+            reverse=True,
+        )[: self.prefetch_size]
+        experts = [expert_idx for expert_idx, _ in experts]
+        for idx, expert_idx in enumerate(experts):
+            device = self.layer2device[next_layer]
+            if not expert_idx in self.loaded_experts_idx[device][next_layer]:
+                self.load_expert_weights(
+                    expert_idx + (next_layer - 1) * self.expert_num_per_layer,
+                    non_blocking=True,
+                    loading_lock=self.prefetch_lock[idx],
+                )
+
+    def wait_prefetch(self):
+        for lock in self.prefetch_lock:
+            for l in lock:
+                l.wait()
+        self.prefetching = False
+
     def get_hits_and_misses(self):
+        with open("usage.json", "w") as f:
+            json.dump(self.usage_count, f)
         return self.hits, self.misses
 
-    def get_expert_weights(self, expert_idx, deepcopy=False):
+    def get_expert_weights(self, expert_idx, deepcopy=False, loading_lock=None):
         layer = expert_idx // self.expert_num_per_layer
         device = self.layer2device[layer]
         if expert_idx in self.loaded_experts_idx[device][layer].keys():
@@ -1058,35 +1113,31 @@ class KExpertsCache:
             )
             memory_slot = self.loaded_experts_idx[device][layer][expert_idx]
             if deepcopy:
-                return (
-                    self.gate_memory[device][memory_slot].clone().view(self.gate_shape),
-                    self.up_memory[device][memory_slot].clone().view(self.up_shape),
-                    self.down_memory[device][memory_slot].clone().view(self.down_shape),
+                loading_lock[0].wait()
+                loading_lock[1].wait()
+                loading_lock[2].wait()
+                expert = (
+                    self.gate_views[device][memory_slot].clone(),
+                    self.up_views[device][memory_slot].clone(),
+                    self.down_views[device][memory_slot].clone(),
                 )
+                # self.loading_lock[expert_idx % self.expert_num_per_layer].record()
+                return expert
             else:
-                return (
-                    self.gate_memory[device][memory_slot].view(self.gate_shape),
-                    self.up_memory[device][memory_slot].view(self.up_shape),
-                    self.down_memory[device][memory_slot].view(self.down_shape),
+                expert = (
+                    self.gate_views[device][memory_slot],
+                    self.up_views[device][memory_slot],
+                    self.down_views[device][memory_slot],
                 )
-        self.load_expert_weights(expert_idx)
-        return self.get_expert_weights(expert_idx, deepcopy=deepcopy)
+                return expert
+        self.load_expert_weights(
+            expert_idx, non_blocking=True, loading_lock=loading_lock
+        )
+        return self.get_expert_weights(
+            expert_idx, deepcopy=deepcopy, loading_lock=loading_lock
+        )
 
-    def prefetch_expert(self, layer_idx):
-        self.prefetching = True
-        # 取本层使用最多的3个专家
-        experts = sorted(
-            enumerate(self.usage_count[layer_idx]),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:3]
-        for expert_idx, _ in experts:
-            self.load_expert_weights(
-                expert_idx + (layer_idx - 1) * self.expert_num_per_layer
-            )
-        self.prefetch_lock.record(torch.cuda.current_stream())
-        self.prefetching = False
-
+    # CUDA_VISIBLE_DEVICES=6 nsys profile -t cuda,nvtx  python /data/yanfansun/ktrans/ktransformers/ktransformers/local_chat.py
     def load_weights_to_storage(self, gate, up, down, expert_idx, dtype):
         gate = self.weight_to_storage(gate, dtype, torch.device("cpu"))
         up = self.weight_to_storage(up, dtype, torch.device("cpu"))
@@ -1097,7 +1148,8 @@ class KExpertsCache:
         self.down_storage[expert_idx].copy_(down)
 
         # 如果有空位，先加载到显存中
-        self.load_expert_weights(expert_idx, init=True)
+        loading_lock = [torch.cuda.Event() for _ in range(3)]
+        self.load_expert_weights(expert_idx, init=True, loading_lock=loading_lock)
 
 
 EXPERTS_MAP = {
@@ -1395,12 +1447,8 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
             return y
 
         if self.config.n_shared_experts is not None:
-            start = time.time()
             y_ = self.shared_experts(identity).squeeze(0)
-            end = time.time()
-            shared_time.append(end - start)
 
-            # print(f"shared_expert forward avg time: {sum(shared_time)/len(shared_time)}")
         if isinstance(self.experts, KExpertsBase):
             y = (
                 self.moe_on_cpuinfer(hidden_states, topk_idx, topk_weight)

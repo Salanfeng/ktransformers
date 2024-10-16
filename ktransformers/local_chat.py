@@ -142,7 +142,7 @@ def local_chat(
         print("using cpu")
 
     content = "请说出2的1到10次方"
-
+    print("content:", content)
     messages = [{"role": "user", "content": content}]
     input_tensor = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
@@ -200,16 +200,12 @@ def local_chat(
         generated = prefill_and_generate(
             model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph
         )
-        hits, misses, get_time, load_time = cache.get_hits_and_misses()
+        hits, misses = cache.get_hits_and_misses()
         print(
             "hits:",
             hits,
             "misses:",
             misses,
-            "get_time:",
-            get_time,
-            "load_time:",
-            load_time,
         )
 
 
