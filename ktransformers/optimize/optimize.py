@@ -192,6 +192,7 @@ def optimize_and_load_gguf(
     model_config: PretrainedConfig,
     default_device: str = "cuda:0",
     load_size = None,
+    prefetch_size = None,
 ):
     with open(rule_file, "r", encoding="utf-8") as f:
         rule_list = yaml.load(f.read(), Loader=yaml.FullLoader)
@@ -204,11 +205,13 @@ def optimize_and_load_gguf(
     device_usage, use_gpu = get_device_usage(optimize_config)
     t1 = time.time()
     if use_gpu:
+        # cache = None
         cache = KExpertsCache(
             config=model_config,
             load_size=load_size,
             dtype=torch.get_default_dtype(),
             devices_usage=device_usage,
+            prefetch_size=prefetch_size,
         )
     else:
         cache = None

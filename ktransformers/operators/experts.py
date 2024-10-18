@@ -728,7 +728,7 @@ class KExpertsTorch(KExpertsBase):
     def unload(self):
         for expert_idx in range(self.expert_num):
             self.cache.unload_expert_weights(
-                expert_idx=expert_idx + (self.layer_idx - 1) * self.expert_num,
+                expert_uid=expert_idx + (self.layer_idx - 1) * self.expert_num,
             )
 
     def forward(
@@ -762,12 +762,12 @@ class KExpertsTorch(KExpertsBase):
         unique_selected_experts = torch.unique(selected_experts_cpu).tolist()
         # 提前加载需要使用的专家权重
         self.cache.wait_prefetch()
-        expert_weights = self.cache.get_experts_weights(
+        expert_weights, sorted_idx = self.cache.get_experts_weights(
             unique_selected_experts, self.layer_idx, self.loading_lock
         )
-        # self.cache.prefetch_expert(layer_idx=self.layer_idx)
+        self.cache.prefetch_expert(layer_idx=self.layer_idx)
         # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in unique_selected_experts:
+        for expert_idx in sorted_idx:
             idx, top_x = torch.where(expert_mask[expert_idx])
             current_state = hidden_states_cpu[None, top_x].reshape(-1, hidden_dim)
 
@@ -799,11 +799,11 @@ class KExpertsCache:
         self,
         config: PretrainedConfig,
         load_size=None,
+        prefetch_size=None,
         dtype=torch.get_default_dtype(),
         devices_usage=None,
     ):
         if not hasattr(self, "initialized"):
-            # 如果config有n_routed_experts
             if load_size is None:
                 from math import sqrt
 
@@ -814,7 +814,12 @@ class KExpertsCache:
             else:
                 assert len(load_size) == config.num_hidden_layers
                 self.load_size = load_size
+            if prefetch_size is None:
+                self.prefetch_size = 2
+            else:
+                self.prefetch_size = prefetch_size
             self.dtype = dtype
+            # 兼容多个模型
             if hasattr(config, "n_routed_experts"):
                 self.expert_num_per_layer = config.n_routed_experts
                 self.total_expert_num = config.n_routed_experts * (
@@ -941,14 +946,16 @@ class KExpertsCache:
 
             # CUDA Stream
             self.copy_stream = torch.cuda.Stream()
+            self.prefetch_stream = torch.cuda.Stream()
             # 专家使用次数
-            self.usage_count = []
-            for layer in range(0, config.num_hidden_layers):
-                self.usage_count.append([0] * self.expert_num_per_layer)
-                self.usage_count[layer][0] = -1
-            # with open("usage.json", "r") as f:
-            #     self.usage_count = json.load(f)
-            self.prefetch_size = 1
+            # self.usage_count = []
+            # for layer in range(0, config.num_hidden_layers):
+            #     self.usage_count.append([0] * self.expert_num_per_layer)
+            #     self.usage_count[layer][0] = -1
+            with open(
+                "/data/yanfansun/ktrans/ktransformers/ktransformers/usage.json", "r"
+            ) as f:
+                self.usage_count = json.load(f)
             self.prefetch_lock = [
                 [torch.cuda.Event() for _ in range(3)]
                 for _ in range(self.prefetch_size)
@@ -956,6 +963,9 @@ class KExpertsCache:
             self.prefetching = False
             self.hits = 0
             self.misses = 0
+            self.fetch_hits = 0
+            self.fetch_misses = 0
+            self.fetchs = {}
             self.initialized = True
 
     def initialize_free_memory_slots(self):
@@ -988,10 +998,10 @@ class KExpertsCache:
         return weight
 
     def load_expert_weights(
-        self, expert_idx, init=False, non_blocking=True, loading_lock=None
+        self, expert_uid, init=False, non_blocking=True, loading_lock=None, stream=None
     ):
         # 找位置
-        layer_idx = expert_idx // self.expert_num_per_layer
+        layer_idx = expert_uid // self.expert_num_per_layer + 1
         device = self.layer2device[layer_idx]
         if not self.free_memory_slots[device][layer_idx]:
             if init:
@@ -1008,72 +1018,80 @@ class KExpertsCache:
         # 空闲位置
         memory_slot = self.free_memory_slots[device][layer_idx].pop(0)
         # 用 CUDA Stream
-        with torch.cuda.stream(self.copy_stream):
+        if stream is None:
+            stream = self.copy_stream
+        with torch.cuda.stream(stream):
             self.gate_memory[device][memory_slot].copy_(
-                self.gate_storage[expert_idx],
+                self.gate_storage[expert_uid],
                 non_blocking=non_blocking,
             )
             loading_lock[0].record()
             self.up_memory[device][memory_slot].copy_(
-                self.up_storage[expert_idx],
+                self.up_storage[expert_uid],
                 non_blocking=non_blocking,
             )
             loading_lock[1].record()
             self.down_memory[device][memory_slot].copy_(
-                self.down_storage[expert_idx],
+                self.down_storage[expert_uid],
                 non_blocking=non_blocking,
             )
             loading_lock[2].record()
         # 记录加载的专家索引和位置
-        self.loaded_experts_idx[device][layer_idx][expert_idx] = memory_slot
+        self.loaded_experts_idx[device][layer_idx][expert_uid] = memory_slot
 
-    def unload_expert_weights(self, expert_idx, device=None, layer_idx=None):
+    def unload_expert_weights(self, expert_uid, device=None, layer_idx=None):
         # 获取专家在显存中的位置
         if device is None:
-            layer_idx = expert_idx // self.expert_num_per_layer
+            layer_idx = expert_uid // self.expert_num_per_layer + 1
             device = self.layer2device[layer_idx]
-        if expert_idx not in self.loaded_experts_idx[device][layer_idx]:
+        if expert_uid not in self.loaded_experts_idx[device][layer_idx]:
             return
-        memory_slot = self.loaded_experts_idx[device][layer_idx][expert_idx]
+        memory_slot = self.loaded_experts_idx[device][layer_idx][expert_uid]
         self.free_memory_slots[device][layer_idx].append(memory_slot)
-        self.loaded_experts_idx[device][layer_idx].pop(expert_idx)
+        self.loaded_experts_idx[device][layer_idx].pop(expert_uid)
 
     def get_experts_weights(self, expert_idxs, layer_idx, loading_lock):
-        # prefetch_experts = sorted(
-        #     enumerate(self.usage_count[layer_idx]),
-        #     key=lambda x: x[1],
-        #     reverse=True,
-        # )[:self.prefetch_size]
-        # for expert_idx, _ in prefetch_experts:
-        #     if expert_idx in expert_idxs:
-        #         self.hits += 1
-        #     else:
-        #         self.misses += 1
         experts = {}
         if len(expert_idxs) > self.load_size[layer_idx]:
             deepcopy = True
         else:
             deepcopy = False
-        # load_idxs = []
-        # unload_idxs = []
-        # for expert_idx in expert_idxs:
-        #     self.usage_count[layer_idx][expert_idx] += 1
-        #     device = self.layer2device[layer_idx]
-        #     if expert_idx in self.loaded_experts_idx[device][layer_idx].keys():
-        #         load_idxs.append(expert_idx)
-        #     else:
-        #         unload_idxs.append(expert_idx)
+        load_idxs = []
+        unload_idxs = []
 
         for expert_idx in expert_idxs:
+            self.usage_count[layer_idx][expert_idx] += 1
+            device = self.layer2device[layer_idx]
+            expert_uid = expert_idx + (layer_idx - 1) * self.expert_num_per_layer
+            if expert_uid in self.loaded_experts_idx[device][layer_idx].keys():
+                load_idxs.append(expert_idx)
+                self.fetch_hits += 1
+            else:
+                unload_idxs.append(expert_idx)
+                self.fetch_misses += 1
+            # 如果self.fetchs[layer_idx]存在
+            if layer_idx in self.fetchs.keys():
+                if expert_uid in self.fetchs[layer_idx]:
+                    self.hits += 1
+                else:
+                    self.misses += 1
+        if layer_idx in self.fetchs.keys():
+            self.fetchs[layer_idx] = []
+
+        sorted_idxs = load_idxs + unload_idxs
+        for expert_idx in sorted_idxs:
             experts[expert_idx] = self.get_expert_weights(
                 expert_idx + (layer_idx - 1) * self.expert_num_per_layer,
                 deepcopy=deepcopy,
                 loading_lock=loading_lock[expert_idx],
             )
-        return experts
+        return experts, sorted_idxs
 
     def prefetch_expert(self, layer_idx):
-        next_layer = layer_idx + 1 if layer_idx + 1 < len(self.load_size) else 1
+        if layer_idx + 1 < len(self.load_size):
+            next_layer = layer_idx + 1
+        else:
+            return
         self.prefetching = True
         # 取使用最多的prefetch_size个expert
         # TODO better strategy
@@ -1085,11 +1103,14 @@ class KExpertsCache:
         experts = [expert_idx for expert_idx, _ in experts]
         for idx, expert_idx in enumerate(experts):
             device = self.layer2device[next_layer]
-            if not expert_idx in self.loaded_experts_idx[device][next_layer]:
+            expert_uid = expert_idx + (next_layer - 1) * self.expert_num_per_layer
+            self.fetchs[next_layer] = self.loaded_experts_idx[device][next_layer].keys()
+            if not expert_uid in self.loaded_experts_idx[device][next_layer].keys():
                 self.load_expert_weights(
-                    expert_idx + (next_layer - 1) * self.expert_num_per_layer,
+                    expert_uid,
                     non_blocking=True,
                     loading_lock=self.prefetch_lock[idx],
+                    stream=self.prefetch_stream,
                 )
 
     def wait_prefetch(self):
@@ -1099,19 +1120,21 @@ class KExpertsCache:
         self.prefetching = False
 
     def get_hits_and_misses(self):
-        with open("usage.json", "w") as f:
+        with open(
+            "/data/yanfansun/ktrans/ktransformers/ktransformers/usage.json", "w"
+        ) as f:
             json.dump(self.usage_count, f)
-        return self.hits, self.misses
+        return self.hits, self.misses, self.fetch_hits, self.fetch_misses
 
-    def get_expert_weights(self, expert_idx, deepcopy=False, loading_lock=None):
-        layer = expert_idx // self.expert_num_per_layer
+    def get_expert_weights(self, expert_uid, deepcopy=False, loading_lock=None):
+        layer = expert_uid // self.expert_num_per_layer + 1
         device = self.layer2device[layer]
-        if expert_idx in self.loaded_experts_idx[device][layer].keys():
+        if expert_uid in self.loaded_experts_idx[device][layer].keys():
             # 将已加载的专家权重移动到字典的末尾(LRU更新)
-            self.loaded_experts_idx[device][layer][expert_idx] = (
-                self.loaded_experts_idx[device][layer].pop(expert_idx)
+            self.loaded_experts_idx[device][layer][expert_uid] = (
+                self.loaded_experts_idx[device][layer].pop(expert_uid)
             )
-            memory_slot = self.loaded_experts_idx[device][layer][expert_idx]
+            memory_slot = self.loaded_experts_idx[device][layer][expert_uid]
             if deepcopy:
                 loading_lock[0].wait()
                 loading_lock[1].wait()
@@ -1121,7 +1144,7 @@ class KExpertsCache:
                     self.up_views[device][memory_slot].clone(),
                     self.down_views[device][memory_slot].clone(),
                 )
-                # self.loading_lock[expert_idx % self.expert_num_per_layer].record()
+                # self.loading_lock[expert_uid % self.expert_num_per_layer].record()
                 return expert
             else:
                 expert = (
@@ -1131,25 +1154,25 @@ class KExpertsCache:
                 )
                 return expert
         self.load_expert_weights(
-            expert_idx, non_blocking=True, loading_lock=loading_lock
+            expert_uid, non_blocking=True, loading_lock=loading_lock
         )
         return self.get_expert_weights(
-            expert_idx, deepcopy=deepcopy, loading_lock=loading_lock
+            expert_uid, deepcopy=deepcopy, loading_lock=loading_lock
         )
 
     # CUDA_VISIBLE_DEVICES=6 nsys profile -t cuda,nvtx  python /data/yanfansun/ktrans/ktransformers/ktransformers/local_chat.py
-    def load_weights_to_storage(self, gate, up, down, expert_idx, dtype):
+    def load_weights_to_storage(self, gate, up, down, expert_uid, dtype):
         gate = self.weight_to_storage(gate, dtype, torch.device("cpu"))
         up = self.weight_to_storage(up, dtype, torch.device("cpu"))
         down = self.weight_to_storage(down, dtype, torch.device("cpu"))
         # 将传入的参数从 CPU 复制到已经分配好地址的 storage 中
-        self.gate_storage[expert_idx].copy_(gate)
-        self.up_storage[expert_idx].copy_(up)
-        self.down_storage[expert_idx].copy_(down)
+        self.gate_storage[expert_uid].copy_(gate)
+        self.up_storage[expert_uid].copy_(up)
+        self.down_storage[expert_uid].copy_(down)
 
         # 如果有空位，先加载到显存中
         loading_lock = [torch.cuda.Event() for _ in range(3)]
-        self.load_expert_weights(expert_idx, init=True, loading_lock=loading_lock)
+        self.load_expert_weights(expert_uid, init=True, loading_lock=loading_lock)
 
 
 EXPERTS_MAP = {
@@ -1430,7 +1453,7 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
         sequence_length = orig_shape[1]
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        t1 = time.time()
+        # t1 = time.time()
         if sequence_length == 1 and hasattr(
             self.experts.generate_experts, "submit_for_one_decode"
         ):
@@ -1442,7 +1465,7 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
             y = self.experts.generate_experts.sync_for_one_decode().unsqueeze(0)
             y += y_
             y.resize_(*orig_shape)
-            t3 = time.time()
+            # t3 = time.time()
             # print(f"moe_infer time: {t3-t1}")
             return y
 
@@ -1472,7 +1495,7 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
         if self.config.n_shared_experts is not None:
             y += y_
 
-        t2 = time.time()
+        # t2 = time.time()
         # print(f"moe_infer time: {t2-t1}")
         return y
 

@@ -121,10 +121,18 @@ def local_chat(
         )
     # 储存每层cache的大小
     load_size = [16] * config.num_hidden_layers
+    load_size[0] = 0
+    prefetch_size = 1
     print("load_size:", load_size)
+    print("prefetch_size:", prefetch_size)
     start = time.time()
     cache = optimize_and_load_gguf(
-        model, optimize_rule_path, gguf_path, config, load_size=load_size
+        model,
+        optimize_rule_path,
+        gguf_path,
+        config,
+        load_size=load_size,
+        prefetch_size=prefetch_size,
     )
     end = time.time()
     print("optimize_and_load_gguf time:", end - start)
@@ -141,6 +149,7 @@ def local_chat(
     else:
         print("using cpu")
 
+    # content = "write quick sort algorithm in python"
     content = "请说出2的1到10次方"
     print("content:", content)
     messages = [{"role": "user", "content": content}]
@@ -152,61 +161,20 @@ def local_chat(
         torch.bfloat16
     )  # TODO: Remove this, replace dtype using config
 
-    test = False
-    if test:
-        data = torch.load("/data/yanfansun/ktrans/ktransformers/data.pt")
-        input_tensor = data["input_tensor"][0]
-        expert_ids = data["expert_ids"][0]
-        weights = data["weights"][0]
-        random_weights = []
-        random_expert_ids = []
-        random_input_tensor = []
-        for _ in range(1000):
-            random_input_tensor.append(torch.randn(input_tensor.size()))
-            random_weights.append(torch.randn(torch.Size([2])))
-            random_expert_ids.append(torch.randint(1, 63, torch.Size([2])))
-        experts = model.model.layers[1].mlp.experts.generate_experts
-        input_tensor = input_tensor.contiguous().cpu()
-        expert_ids = expert_ids.contiguous().cpu()
-        weights = weights.contiguous().to(torch.float32).cpu()
-        output = torch.empty_like(input_tensor).contiguous()
-        end = time.time()
-        while (end - start) < 27.5:
-            print("waiting for 30s")
-            time.sleep(0.5)
-            end = time.time()
-
-        for i in range(1000):
-            for j in range(1, 26):
-                experts = model.model.layers[j].mlp.experts.generate_experts
-                weights = random_weights[i]
-                expert_ids = random_expert_ids[i]
-                input_tensor = random_input_tensor[i]
-                experts.cpu_infer.submit_with_cuda_stream(
-                    torch.cuda.current_stream(experts.out_device).cuda_stream,
-                    experts.moe.forward(
-                        1,
-                        expert_ids.size(0),
-                        expert_ids.data_ptr(),
-                        weights.data_ptr(),
-                        input_tensor.data_ptr(),
-                        output.data_ptr(),
-                    ),
-                )
-                experts.cpu_infer.sync_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream
-                )
-    else:
-        generated = prefill_and_generate(
-            model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph
-        )
-        hits, misses = cache.get_hits_and_misses()
-        print(
-            "hits:",
-            hits,
-            "misses:",
-            misses,
-        )
+    generated = prefill_and_generate(
+        model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph
+    )
+    hits, misses, fetchhit, fetchmiss = cache.get_hits_and_misses()
+    print(
+        "no prefetch hits:",
+        hits,
+        "no prefetch misses:",
+        misses,
+        "fetch hits:",
+        fetchhit,
+        "fetch misses:",
+        fetchmiss,
+    )
 
 
 if __name__ == "__main__":

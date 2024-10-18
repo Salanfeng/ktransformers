@@ -1236,7 +1236,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        start = time.time()
+        # start = time.time()
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1247,8 +1247,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        end = time.time()
-        attn_time.append(end - start)
+        # end = time.time()
+        # attn_time.append(end - start)
         # print(f"Self Attention Time: {end - start}")
         # print(f"Self Attention avg Time: {sum(attn_time) / len(attn_time)}")
         hidden_states = residual + hidden_states

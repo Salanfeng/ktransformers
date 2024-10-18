@@ -1,0 +1,29 @@
+config file path: /data/yanfansun/ktrans/ktransformers/ktransformers/configs/config.yaml
+cpu_infer: 46
+using custom modeling_xxx.py.
+using default_optimize_rule for DeepseekV2ForCausalLM
+load_size: [0, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64]
+prefetch_size: 1
+KExpertsCache init time: 22.75981092453003
+optimize_and_load_gguf time: 35.691269636154175
+using cpu
+content: 请说出2的1到10次方
+ 2的1到10次方分别是：
+
+- 2^1 = 2
+- 2^2 = 4
+- 2^3 = 8
+- 2^4 = 16
+- 2^5 = 32
+- 2^6 = 64
+- 2^7 = 128
+- 2^8 = 256
+- 2^9 = 512
+- 2^10 = 1024
+prompt eval count:    18 token(s)
+prompt eval duration: 1.7345936298370361s
+prompt eval rate:     10.377070277659838 tokens/s
+eval count:           116 token(s)
+eval duration:        26.62945294380188s
+eval rate:            4.356078971836314 tokens/s
+hits: 0 misses: 0 fetch: 0

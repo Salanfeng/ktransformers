@@ -56,7 +56,6 @@ class LinearCache:
     def _load(self, index):
         with torch.cuda.stream(self.copy_stream):
             self.storage1.copy_(self.w1_offloaded_storages[index], non_blocking=True)
-            self.storage1.to("cpu")
             self.w1_event.record()
             self.storage2.copy_(self.w3_offloaded_storages[index], non_blocking=True)
             self.w3_event.record()
